@@ -9,8 +9,19 @@
  * AHT20/BMP280 module:
  *   VCC -> 3V3
  *   GND -> GND
- *   SDA -> PB9  (Arduino D14)
- *   SCL -> PB8  (Arduino D15)
+ *
+ *   Sensor 0, original wiring:
+ *     SDA -> PB9  (Arduino D14)
+ *     SCL -> PB8  (Arduino D15)
+ *
+ *   Sensor 1, alternate wiring:
+ *     SDA -> PB7
+ *     SCL -> PB6  (Arduino D10)
+ *
+ *   AHT20 modules usually use the fixed I2C address 0x38.
+ *   Because of that, multiple sensors cannot share one active I2C bus directly.
+ *   This firmware enables only one I2C1 pin pair at a time, reads that sensor,
+ *   then switches to the next pin pair.
  *
  * 1602A LCD in 4-bit parallel mode, using CN9 D2~D7:
  *   VSS -> GND
@@ -47,7 +58,57 @@
  *     LED short leg(-) -> GND
  */
 
+/*
+ * Code module map
+ *
+ * 1. Hardware map and constants
+ *    - Pin macros, humidity thresholds, servo pulse widths, timing values.
+ *    - When wiring or test conditions change, this is the first area to check.
+ *
+ * 2. HAL peripheral handles and runtime state
+ *    - hi2c1, htim3, huart2 are HAL objects for I2C, PWM timer, and UART.
+ *    - dehumidifier_on and timestamp variables remember the current control state.
+ *
+ * 3. Small utility layer
+ *    - delay_ms(), uart_print(), boot_mark(), number formatting helpers.
+ *    - These keep debug output and timing code simple in the rest of the file.
+ *
+ * 4. Servo and dehumidifier actuator layer
+ *    - servo_set_pulse_us() generates SG90 positions through TIM3_CH2 PWM.
+ *    - servo_press_power_button() physically presses the dehumidifier button.
+ *    - dehumidifier_set() updates the logical ON/OFF state after pressing.
+ *
+ * 5. Safety and timing policy layer
+ *    - min_off_time_passed() and max_on_time_passed() decide whether another
+ *      button press is allowed.
+ *    - The 5-minute OFF wait is currently bypassed for servo testing.
+ *
+ * 6. AHT20 sensor driver layer
+ *    - aht20_send_command(), aht20_read_status(), aht20_init(), aht20_read().
+ *    - This talks directly to the sensor with HAL I2C, without an external library.
+ *
+ * 7. LCD 1602A parallel 4-bit driver layer
+ *    - lcd_write_4bits(), lcd_send(), lcd_command(), lcd_data(), lcd_init().
+ *    - This controls RS/E/D4~D7 GPIO pins directly.
+ *
+ * 8. Display/reporting layer
+ *    - lcd_show_status() writes the user-facing state to the LCD.
+ *    - serial_show_display_status() mirrors the LCD-style status to UART.
+ *
+ * 9. Main application flow
+ *    - main() initializes HAL/peripherals, prints boot checkpoints, then loops.
+ *    - Every SENSOR_READ_INTERVAL_MS, it reads humidity and applies ON/OFF logic.
+ *
+ * 10. STM32Cube HAL setup and interrupt glue
+ *    - SystemClock_Config(), MX_*_Init(), HAL_*_MspInit(), Error_Handler().
+ *    - SysTick_Handler() is required so HAL_Delay() and HAL_GetTick() work.
+ */
+
+/* 1. Hardware map and constants */
+
 #define AHT20_I2C_ADDRESS        (0x38 << 1)
+
+#define SENSOR_COUNT             2U
 
 #define LCD_RS_GPIO_PORT         GPIOA
 #define LCD_RS_GPIO_PIN          GPIO_PIN_10
@@ -82,9 +143,24 @@
 // In this mode, the firmware does not initialize I2C, LCD, sensor, or servo.
 #define SERIAL_ONLY_TEST         0
 
+/* 2. HAL peripheral handles and runtime state */
+
 I2C_HandleTypeDef hi2c1;
 TIM_HandleTypeDef htim3;
 UART_HandleTypeDef huart2;
+
+typedef struct {
+  GPIO_TypeDef *scl_port;
+  uint16_t scl_pin;
+  GPIO_TypeDef *sda_port;
+  uint16_t sda_pin;
+  const char *label;
+} SensorI2cBusConfig;
+
+static const SensorI2cBusConfig sensor_i2c_buses[SENSOR_COUNT] = {
+  {GPIOB, GPIO_PIN_8, GPIOB, GPIO_PIN_9, "SCL PB8, SDA PB9"},
+  {GPIOB, GPIO_PIN_6, GPIOB, GPIO_PIN_7, "SCL PB6, SDA PB7"}
+};
 
 static bool dehumidifier_on = false;
 static bool uart_ready = false;
@@ -93,10 +169,12 @@ static uint32_t dehumidifier_turned_off_at = 0;
 
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
-static void MX_I2C1_Init(void);
+static bool MX_I2C1_Init(void);
 static void MX_TIM3_Init(void);
 static void MX_USART2_UART_Init(void);
 static void Error_Handler(void);
+
+/* 3. Small utility layer */
 
 static void delay_ms(uint32_t ms)
 {
@@ -140,6 +218,19 @@ static void uart_print_uint(uint32_t value)
   uart_print(&buffer[index]);
 }
 
+static void uart_print_sensor_pin_plan(void)
+{
+  uint8_t sensor_index;
+
+  for (sensor_index = 0; sensor_index < SENSOR_COUNT; sensor_index++) {
+    uart_print("[I2C] sensor ");
+    uart_print_uint(sensor_index);
+    uart_print(": ");
+    uart_print(sensor_i2c_buses[sensor_index].label);
+    uart_print("\r\n");
+  }
+}
+
 static void uart_print_fixed_1(float value)
 {
   int32_t scaled = (int32_t)(value * 10.0f);
@@ -153,6 +244,8 @@ static void uart_print_fixed_1(float value)
   uart_print(".");
   uart_print_uint((uint32_t)(scaled % 10));
 }
+
+/* 4. Servo and dehumidifier actuator layer */
 
 static void servo_set_pulse_us(uint16_t pulse_us)
 {
@@ -187,6 +280,8 @@ static void dehumidifier_set(bool on)
   }
 }
 
+/* 5. Safety and timing policy layer */
+
 static bool min_off_time_passed(void)
 {
   // Servo operation test mode:
@@ -206,6 +301,76 @@ static bool max_on_time_passed(void)
 {
   return dehumidifier_on && ((HAL_GetTick() - dehumidifier_turned_on_at) >= MAX_ON_TIME_MS);
 }
+
+static void sensor_i2c_release_bus_pins(uint8_t sensor_index)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  const SensorI2cBusConfig *bus = &sensor_i2c_buses[sensor_index];
+
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+
+  if (bus->scl_port == bus->sda_port) {
+    GPIO_InitStruct.Pin = bus->scl_pin | bus->sda_pin;
+    HAL_GPIO_Init(bus->scl_port, &GPIO_InitStruct);
+  } else {
+    GPIO_InitStruct.Pin = bus->scl_pin;
+    HAL_GPIO_Init(bus->scl_port, &GPIO_InitStruct);
+
+    GPIO_InitStruct.Pin = bus->sda_pin;
+    HAL_GPIO_Init(bus->sda_port, &GPIO_InitStruct);
+  }
+}
+
+static void sensor_i2c_release_all_pins(void)
+{
+  uint8_t sensor_index;
+
+  for (sensor_index = 0; sensor_index < SENSOR_COUNT; sensor_index++) {
+    sensor_i2c_release_bus_pins(sensor_index);
+  }
+}
+
+static void sensor_i2c_configure_bus_pins(uint8_t sensor_index)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  const SensorI2cBusConfig *bus = &sensor_i2c_buses[sensor_index];
+
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_OD;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  GPIO_InitStruct.Alternate = GPIO_AF4_I2C1;
+
+  if (bus->scl_port == bus->sda_port) {
+    GPIO_InitStruct.Pin = bus->scl_pin | bus->sda_pin;
+    HAL_GPIO_Init(bus->scl_port, &GPIO_InitStruct);
+  } else {
+    GPIO_InitStruct.Pin = bus->scl_pin;
+    HAL_GPIO_Init(bus->scl_port, &GPIO_InitStruct);
+
+    GPIO_InitStruct.Pin = bus->sda_pin;
+    HAL_GPIO_Init(bus->sda_port, &GPIO_InitStruct);
+  }
+}
+
+static bool sensor_i2c_select(uint8_t sensor_index)
+{
+  if (sensor_index >= SENSOR_COUNT) {
+    return false;
+  }
+
+  if (hi2c1.Instance == I2C1) {
+    HAL_I2C_DeInit(&hi2c1);
+  }
+  sensor_i2c_release_all_pins();
+  sensor_i2c_configure_bus_pins(sensor_index);
+  delay_ms(2);
+
+  return MX_I2C1_Init();
+}
+
+/* 6. AHT20 sensor driver layer */
 
 static bool aht20_send_command(uint8_t command, uint8_t data0, uint8_t data1)
 {
@@ -280,6 +445,26 @@ static bool aht20_read(float *humidity_percent, float *temperature_c)
 
   return true;
 }
+
+static bool aht20_init_sensor(uint8_t sensor_index)
+{
+  if (!sensor_i2c_select(sensor_index)) {
+    return false;
+  }
+
+  return aht20_init();
+}
+
+static bool aht20_read_sensor(uint8_t sensor_index, float *humidity_percent, float *temperature_c)
+{
+  if (!sensor_i2c_select(sensor_index)) {
+    return false;
+  }
+
+  return aht20_read(humidity_percent, temperature_c);
+}
+
+/* 7. LCD 1602A parallel 4-bit driver layer */
 
 static void lcd_enable_pulse(void)
 {
@@ -386,6 +571,8 @@ static void lcd_clear_line(uint8_t row)
   }
 }
 
+/* 8. Display/reporting layer */
+
 static void lcd_show_status(float humidity)
 {
   uint32_t humidity_ones = (uint32_t)(humidity + 0.5f);
@@ -413,10 +600,13 @@ static void serial_show_display_status(float humidity)
   uart_print("\r\n");
 }
 
+/* 9. Main application flow */
+
 int main(void)
 {
-  bool aht20_ready;
+  bool aht20_ready[SENSOR_COUNT] = {false};
   uint32_t last_sensor_read_at = 0;
+  uint8_t sensor_index;
 
   HAL_Init();
   SystemClock_Config();
@@ -426,6 +616,7 @@ int main(void)
   uart_ready = true;
 
   boot_mark("B0 UART");
+  uart_print_sensor_pin_plan();
 
 #if SERIAL_ONLY_TEST
   while (1) {
@@ -435,7 +626,7 @@ int main(void)
   }
 #endif
 
-  MX_I2C1_Init();
+  sensor_i2c_select(0);
   boot_mark("B1 I2C");
 
   MX_TIM3_Init();
@@ -459,13 +650,19 @@ int main(void)
   lcd_set_cursor(0, 1);
   lcd_print("Power: OFF");
 
-  aht20_ready = aht20_init();
   boot_mark("B5 AHT");
-  uart_print(aht20_ready ? "[AHT20] OK\r\n" : "[AHT20] NOT FOUND\r\n");
+  for (sensor_index = 0; sensor_index < SENSOR_COUNT; sensor_index++) {
+    aht20_ready[sensor_index] = aht20_init_sensor(sensor_index);
+
+    uart_print("[AHT20-");
+    uart_print_uint(sensor_index);
+    uart_print("] ");
+    uart_print(aht20_ready[sensor_index] ? "OK\r\n" : "NOT FOUND\r\n");
+  }
 
   while (1) {
-    float humidity = 0.0f;
-    float temperature = 0.0f;
+    bool has_valid_reading = false;
+    float control_humidity = 0.0f;
 
     if ((HAL_GetTick() - last_sensor_read_at) < SENSOR_READ_INTERVAL_MS) {
       continue;
@@ -473,27 +670,49 @@ int main(void)
     last_sensor_read_at = HAL_GetTick();
     HAL_GPIO_TogglePin(STATUS_LED_GPIO_PORT, STATUS_LED_GPIO_PIN);
 
-    if (!aht20_ready) {
-      uart_print("[SAFE] Humidity sensor missing. Servo will not press button.\r\n");
+    for (sensor_index = 0; sensor_index < SENSOR_COUNT; sensor_index++) {
+      float humidity = 0.0f;
+      float temperature = 0.0f;
+
+      if (!aht20_ready[sensor_index]) {
+        continue;
+      }
+
+      if (!aht20_read_sensor(sensor_index, &humidity, &temperature)) {
+        uart_print("[SAFE] AHT20-");
+        uart_print_uint(sensor_index);
+        uart_print(" read failed.\r\n");
+        continue;
+      }
+
+      uart_print("[AHT20-");
+      uart_print_uint(sensor_index);
+      uart_print("] Humidity: ");
+      uart_print_fixed_1(humidity);
+      uart_print("%, Temp: ");
+      uart_print_fixed_1(temperature);
+      uart_print(" C\r\n");
+
+      if (!has_valid_reading || humidity > control_humidity) {
+        control_humidity = humidity;
+      }
+      has_valid_reading = true;
+    }
+
+    if (!has_valid_reading) {
+      uart_print("[SAFE] No humidity sensor reading. Servo will not press button.\r\n");
       continue;
     }
 
-    if (!aht20_read(&humidity, &temperature)) {
-      uart_print("[SAFE] Sensor read failed. Servo will not press button.\r\n");
-      continue;
-    }
+    uart_print("[CONTROL] Using highest humidity: ");
+    uart_print_fixed_1(control_humidity);
+    uart_print("%\r\n");
 
-    uart_print("[AHT20] Humidity: ");
-    uart_print_fixed_1(humidity);
-    uart_print("%, Temp: ");
-    uart_print_fixed_1(temperature);
-    uart_print(" C\r\n");
-
-    lcd_show_status(humidity);
-    serial_show_display_status(humidity);
+    lcd_show_status(control_humidity);
+    serial_show_display_status(control_humidity);
 
     if (dehumidifier_on) {
-      if (humidity <= HUMIDITY_OFF_PERCENT) {
+      if (control_humidity <= HUMIDITY_OFF_PERCENT) {
         uart_print("[AUTO] Humidity is low enough.\r\n");
         dehumidifier_set(false);
       } else if (max_on_time_passed()) {
@@ -501,17 +720,19 @@ int main(void)
         dehumidifier_set(false);
       }
     } else {
-      if (humidity >= HUMIDITY_ON_PERCENT && min_off_time_passed()) {
+      if (control_humidity >= HUMIDITY_ON_PERCENT && min_off_time_passed()) {
         uart_print("[AUTO] Humidity is high.\r\n");
         dehumidifier_set(true);
-      } else if (humidity >= HUMIDITY_ON_PERCENT) {
+      } else if (control_humidity >= HUMIDITY_ON_PERCENT) {
         uart_print("[WAIT] Minimum OFF time has not passed yet.\r\n");
       }
     }
 
-    lcd_show_status(humidity);
+    lcd_show_status(control_humidity);
   }
 }
+
+/* 10. STM32Cube HAL setup and interrupt glue */
 
 void SystemClock_Config(void)
 {
@@ -549,7 +770,7 @@ void SystemClock_Config(void)
   }
 }
 
-static void MX_I2C1_Init(void)
+static bool MX_I2C1_Init(void)
 {
   HAL_StatusTypeDef result;
 
@@ -568,10 +789,11 @@ static void MX_I2C1_Init(void)
   result = HAL_I2C_Init(&hi2c1);
   if (result != HAL_OK) {
     uart_print("[I2C] init failed\r\n");
-    return;
+    return false;
   }
 
   uart_print("[I2C] init ok\r\n");
+  return true;
 }
 
 static void MX_USART2_UART_Init(void)
@@ -638,12 +860,7 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(STATUS_LED_GPIO_PORT, &GPIO_InitStruct);
 
-  GPIO_InitStruct.Pin = GPIO_PIN_8 | GPIO_PIN_9;
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_OD;
-  GPIO_InitStruct.Pull = GPIO_PULLUP;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
-  GPIO_InitStruct.Alternate = GPIO_AF4_I2C1;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+  sensor_i2c_release_all_pins();
 
   GPIO_InitStruct.Pin = GPIO_PIN_2 | GPIO_PIN_3;
   GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
