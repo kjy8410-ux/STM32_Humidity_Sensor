@@ -1,0 +1,129 @@
+프로젝트: STM32_Humidity Sensor
+보드: Nucleo-F411RE
+개발환경: PlatformIO + STM32Cube HAL
+목표: AHT20 습도센서로 습도를 읽고, SG90 서보모터로 제습기 전원 버튼을 물리적으로 누르는 자동 제습기 제어기 제작. LCD 1602A도 나중에 병렬 4비트 방식으로 표시 예정.
+
+현재 주요 파일:
+- platformio.ini
+- src/main.c
+
+현재 platformio.ini 핵심 설정:
+[env:nucleo_f411re]
+platform = ststm32
+board = nucleo_f411re
+framework = stm32cube
+monitor_speed = 115200
+monitor_port = COM5
+monitor_dtr = 0
+monitor_rts = 0
+upload_protocol = stlink
+debug_tool = stlink
+
+중요: monitor_port = COM5는 기존 PC 기준이므로 다른 PC에서는 COM 포트가 달라질 수 있음. 다른 PC에서는 PlatformIO device list로 확인 후 수정 필요.
+
+하드웨어 연결 현재 기준:
+1. AHT20+BMP280 센서
+- VCC -> 3V3
+- GND -> GND
+- SDA -> D14 / PB9
+- SCL -> D15 / PB8
+
+2. SG90 서보모터
+- 빨강 -> 외부 5V
+- 갈색 -> GND
+- 주황 -> D9 / PC7
+- 외부 5V 전원 GND와 Nucleo GND는 반드시 공통 연결
+- 코드에서는 TIM3_CH2 PWM 사용
+
+3. 1602A LCD 병렬 4비트 방식, 아직 완전 검증 전
+- LCD 1 VSS -> GND
+- LCD 2 VDD -> 3V3 또는 5V
+- LCD 3 V0 -> 가변저항 가운데 핀
+- LCD 4 RS -> D2 / PA10
+- LCD 5 RW -> GND
+- LCD 6 E -> D3 / PB3
+- LCD 11 D4 -> D4 / PB5
+- LCD 12 D5 -> D5 / PB4
+- LCD 13 D6 -> D6 / PB10
+- LCD 14 D7 -> D7 / PA8
+- LCD 15 A -> 3V3 또는 5V
+- LCD 16 K -> GND
+
+지금까지의 코드 변경 경위:
+1. AHT20 센서는 라이브러리 없이 HAL_I2C_Master_Transmit / HAL_I2C_Master_Receive로 직접 제어.
+2. 릴레이 방식은 사용하지 않기로 하고, SG90 서보모터가 제습기 전원 버튼을 누르는 방식으로 변경.
+3. LCD는 처음 I2C LCD로 가정했으나, 실제 LCD가 SDA/SCL 없는 일반 1602A라 병렬 4비트 방식으로 코드 변경.
+4. LCD 표시 내용과 같은 습도/상태 내용을 시리얼 모니터에도 출력하도록 serial_show_display_status() 추가.
+5. 시리얼 모니터가 처음에는 아무것도 안 나오거나 B0 UART까지만 나왔음.
+6. 원인 추적을 위해 B0 UART, B1 I2C, B2 TIM3, B3 PWM, B4 LCD, B5 AHT 같은 부팅 단계 로그 추가.
+7. HAL_Delay()가 멈추는 문제가 있었음. 원인은 SysTick_Handler()가 없어서 HAL tick이 증가하지 않았기 때문.
+8. main.c 맨 아래에 아래 함수를 추가해서 해결:
+   void SysTick_Handler(void)
+   {
+     HAL_IncTick();
+   }
+9. 문제 확인을 위해 SERIAL_ONLY_TEST 모드를 임시로 만들었음.
+   #define SERIAL_ONLY_TEST 1 이면 I2C/LCD/센서/서보 없이 시리얼만 1초마다 출력.
+   현재는 #define SERIAL_ONLY_TEST 0 으로 다시 꺼둠.
+10. 현재 AHT20 습도센서는 시리얼 모니터에 정상 출력됨.
+11. SG90 서보는 D9 / PC7 / TIM3_CH2 기준으로 코드 수정됨.
+12. 테스트 편의를 위해 부팅 시 서보가 한 번 움직이도록 SERVO_TEST_ON_BOOT = 1 설정.
+13. 기존 5분 재동작 제한은 테스트를 위해 min_off_time_passed()에서 return true;로 우회하고, 기존 코드는 주석처리해둠.
+
+현재 코드 동작:
+- 부팅 후 UART 초기화
+- I2C 초기화
+- TIM3 PWM 초기화
+- PWM 시작
+- SERVO_TEST_ON_BOOT가 1이면 서보가 한 번 움직임
+- LCD 초기화 시도
+- AHT20 초기화
+- 1초마다 습도/온도 읽기
+- 시리얼에 출력
+- 습도 >= 65%이면 제습기 ON 상태로 보고 서보 버튼 누름
+- 습도 <= 55%이면 OFF 상태로 보고 서보 버튼 누름
+- 최대 ON 시간은 3시간 설정
+- 5분 OFF 대기는 현재 테스트 목적으로 비활성화
+
+중요한 상수:
+#define SERVO_REST_US            1000U
+#define SERVO_PRESS_US           1800U
+#define SERVO_PRESS_TIME_MS      700UL
+#define SERVO_SETTLE_TIME_MS     700UL
+#define SERVO_TEST_ON_BOOT       1
+
+#define HUMIDITY_ON_PERCENT      65.0f
+#define HUMIDITY_OFF_PERCENT     55.0f
+
+#define SENSOR_READ_INTERVAL_MS  1000UL
+#define MAX_ON_TIME_MS           (3UL * 60UL * 60UL * 1000UL)
+#define MIN_OFF_TIME_MS          (5UL * 60UL * 1000UL)
+
+주의사항:
+- 서보모터는 Nucleo 보드 5V에서 직접 전원 공급하지 않는 것을 권장. 외부 5V 전원 사용.
+- 외부 전원 GND와 Nucleo GND는 반드시 연결해야 PWM 신호 기준이 맞음.
+- LCD는 현재 코드상 병렬 4비트 방식이지만, 아직 실제 화면 출력은 완전히 검증되지 않았음.
+- LCD에 검은 블록만 보이는 경우 V0 대비 조절, RS/E/D4~D7 배선, 5V LCD와 3.3V 신호 호환 문제 확인 필요.
+- 다른 PC에서는 COM5가 아닐 수 있으므로 platformio.ini의 monitor_port 수정 필요.
+- .pio 폴더는 Git에 올리지 않아도 됨.
+- Git에 최소로 올릴 파일은 platformio.ini, src/main.c, .gitignore.
+
+
+
+
+
+
+
+
+
+
+STM32Cube HAL C 프로젝트
+Nucleo-F411RE
+AHT20 I2C: PB9/PB8
+SG90 Servo: D9 / PC7 / TIM3_CH2
+1602A LCD: D2~D7 병렬 4비트
+SysTick_Handler 추가 필수
+SERIAL_ONLY_TEST는 현재 0
+SERVO_TEST_ON_BOOT는 현재 1
+5분 대기 제한은 테스트 때문에 주석 처리
+
