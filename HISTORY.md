@@ -168,4 +168,4 @@ void SysTick_Handler(void)
 - 다른 PC에서는 COM5가 아닐 수 있으므로 `platformio.ini`의 `monitor_port` 수정 필요.
 - `.pio` 폴더는 Git에 올리지 않아도 됨.
 - Git에 최소로 올릴 파일은 `platformio.ini`, `src/main.c`, `.gitignore`, `PROJECT_HISTORY.md`.
-- 수정일: 2026-05-10 - 두 번째 센서를 2m 정도 떨어뜨리는 경우, 먼저 별도 전원 없이 Nucleo의 3V3/GND/SDA/SCL 4선을 연장해서 테스트하는 것을 권장함. 불안정하면 I2C 속도를 낮추거나, 무선 방식으로 갈 경우 센서 쪽 별도 MCU와 전원이 필요함.
+- 수정일: 2026-05-10 - 두 번째 센서를 2m 정도 떨어뜨리기위해, 먼저 별도 전원 없이 Nucleo의 3V3/GND/SDA/SCL 4선을 연장해서 테스트하는 것으로 검토중. 무선 방식으로 갈 경우 센서 쪽 별도 MCU와 전원이 필요함.
