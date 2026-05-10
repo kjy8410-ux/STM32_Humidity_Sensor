@@ -50,27 +50,25 @@ debug_tool = stlink
 - LCD 16 K -> GND
 
 지금까지의 코드 변경 경위:
-1. 처음에는 Arduino/C++ 방식으로 작성되었으나, C언어 학습 목적 때문에 STM32Cube HAL 기반 C 코드로 변경함.
-2. src/main.cpp 대신 src/main.c 사용.
-3. AHT20 센서는 라이브러리 없이 HAL_I2C_Master_Transmit / HAL_I2C_Master_Receive로 직접 제어.
-4. 릴레이 방식은 사용하지 않기로 하고, SG90 서보모터가 제습기 전원 버튼을 누르는 방식으로 변경.
-5. LCD는 처음 I2C LCD로 가정했으나, 실제 LCD가 SDA/SCL 없는 일반 1602A라 병렬 4비트 방식으로 코드 변경.
-6. LCD 표시 내용과 같은 습도/상태 내용을 시리얼 모니터에도 출력하도록 serial_show_display_status() 추가.
-7. 시리얼 모니터가 처음에는 아무것도 안 나오거나 B0 UART까지만 나왔음.
-8. 원인 추적을 위해 B0 UART, B1 I2C, B2 TIM3, B3 PWM, B4 LCD, B5 AHT 같은 부팅 단계 로그 추가.
-9. HAL_Delay()가 멈추는 문제가 있었음. 원인은 SysTick_Handler()가 없어서 HAL tick이 증가하지 않았기 때문.
-10. main.c 맨 아래에 아래 함수를 추가해서 해결:
+1. AHT20 센서는 라이브러리 없이 HAL_I2C_Master_Transmit / HAL_I2C_Master_Receive로 직접 제어.
+2. 릴레이 방식은 사용하지 않기로 하고, SG90 서보모터가 제습기 전원 버튼을 누르는 방식으로 변경.
+3. LCD는 처음 I2C LCD로 가정했으나, 실제 LCD가 SDA/SCL 없는 일반 1602A라 병렬 4비트 방식으로 코드 변경.
+4. LCD 표시 내용과 같은 습도/상태 내용을 시리얼 모니터에도 출력하도록 serial_show_display_status() 추가.
+5. 시리얼 모니터가 처음에는 아무것도 안 나오거나 B0 UART까지만 나왔음.
+6. 원인 추적을 위해 B0 UART, B1 I2C, B2 TIM3, B3 PWM, B4 LCD, B5 AHT 같은 부팅 단계 로그 추가.
+7. HAL_Delay()가 멈추는 문제가 있었음. 원인은 SysTick_Handler()가 없어서 HAL tick이 증가하지 않았기 때문.
+8. main.c 맨 아래에 아래 함수를 추가해서 해결:
    void SysTick_Handler(void)
    {
      HAL_IncTick();
    }
-11. 문제 확인을 위해 SERIAL_ONLY_TEST 모드를 임시로 만들었음.
+9. 문제 확인을 위해 SERIAL_ONLY_TEST 모드를 임시로 만들었음.
    #define SERIAL_ONLY_TEST 1 이면 I2C/LCD/센서/서보 없이 시리얼만 1초마다 출력.
    현재는 #define SERIAL_ONLY_TEST 0 으로 다시 꺼둠.
-12. 현재 AHT20 습도센서는 시리얼 모니터에 정상 출력됨.
-13. SG90 서보는 D9 / PC7 / TIM3_CH2 기준으로 코드 수정됨.
-14. 테스트 편의를 위해 부팅 시 서보가 한 번 움직이도록 SERVO_TEST_ON_BOOT = 1 설정.
-15. 기존 5분 재동작 제한은 테스트를 위해 min_off_time_passed()에서 return true;로 우회하고, 기존 코드는 주석처리해둠.
+10. 현재 AHT20 습도센서는 시리얼 모니터에 정상 출력됨.
+11. SG90 서보는 D9 / PC7 / TIM3_CH2 기준으로 코드 수정됨.
+12. 테스트 편의를 위해 부팅 시 서보가 한 번 움직이도록 SERVO_TEST_ON_BOOT = 1 설정.
+13. 기존 5분 재동작 제한은 테스트를 위해 min_off_time_passed()에서 return true;로 우회하고, 기존 코드는 주석처리해둠.
 
 현재 코드 동작:
 - 부팅 후 UART 초기화
