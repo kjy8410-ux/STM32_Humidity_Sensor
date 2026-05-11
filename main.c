@@ -1,114 +1,12 @@
-#include "stm32f4xx_hal.h"
+#include "stm32f4xx_hal.h"    //STM32-F411RE 보드 사용
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
 
-/*
- * Nucleo-F411RE pin plan
- *
- * AHT20/BMP280 module:
- *   VCC -> 3V3
- *   GND -> GND
- *
- *   Sensor 0, original wiring:
- *     SDA -> PB9  (Arduino D14)
- *     SCL -> PB8  (Arduino D15)
- *
- *   Sensor 1, alternate wiring:
- *     SDA -> PB7
- *     SCL -> PB6  (Arduino D10)
- *
- *   AHT20 modules usually use the fixed I2C address 0x38.
- *   Because of that, multiple sensors cannot share one active I2C bus directly.
- *   This firmware enables only one I2C1 pin pair at a time, reads that sensor,
- *   then switches to the next pin pair.
- *
- * 1602A LCD in 4-bit parallel mode, using CN9 D2~D7:
- *   VSS -> GND
- *   VDD -> 3V3 first. 5V may work, but 3V3 is safer for STM32 logic.
- *   V0  -> 10k potentiometer center pin for contrast
- *   GND -> GND
- *   RS  -> D2  / PA10
- *   RW  -> GND
- *   E   -> D3  / PB3
- *   D4  -> D4  / PB5
- *   D5  -> D5  / PB4
- *   D6  -> D6  / PB10
- *   D7  -> D7  / PA8
- *   A   -> 3V3 or 5V for backlight
- *   K   -> GND
- *
- * Servo motor:
- *   Orange signal -> D9 / PC7  (TIM3_CH2 PWM)
- *   Red VCC       -> external 5V servo power supply
- *   Brown GND     -> external power GND and Nucleo GND must be common
- *
- * SG90 wire colors:
- *   Orange -> PWM signal
- *   Red    -> 5V
- *   Brown  -> GND
- *
- * Do not power the servo from the Nucleo 5V pin while testing under load.
- * Use an external 5V supply, and connect its GND to Nucleo GND.
- *
- * Status LED for firmware-running check:
- *   If your board has a user LED on D13/PA5, it will blink automatically.
- *   If not, connect an external LED:
- *     D13 / PA5 -> 220 ohm resistor -> LED long leg(+)
- *     LED short leg(-) -> GND
- */
+//하드웨어 핀
+#define AHT20_I2C_ADDRESS        (0x38 << 1)  //습도센서 하드웨어 주소를 펌웨어 주소로 재가공
 
-/*
- * Code module map
- *
- * 1. Hardware map and constants
- *    - Pin macros, humidity thresholds, servo pulse widths, timing values.
- *    - When wiring or test conditions change, this is the first area to check.
- *
- * 2. HAL peripheral handles and runtime state
- *    - hi2c1, htim3, huart2 are HAL objects for I2C, PWM timer, and UART.
- *    - dehumidifier_on and timestamp variables remember the current control state.
- *
- * 3. Small utility layer
- *    - delay_ms(), uart_print(), boot_mark(), number formatting helpers.
- *    - These keep debug output and timing code simple in the rest of the file.
- *
- * 4. Servo and dehumidifier actuator layer
- *    - servo_set_pulse_us() generates SG90 positions through TIM3_CH2 PWM.
- *    - servo_press_power_button() physically presses the dehumidifier button.
- *    - dehumidifier_set() updates the logical ON/OFF state after pressing.
- *
- * 5. Safety and timing policy layer
- *    - min_off_time_passed() and max_on_time_passed() decide whether another
- *      button press is allowed.
- *    - The 5-minute OFF wait is currently bypassed for servo testing.
- *
- * 6. AHT20 sensor driver layer
- *    - aht20_send_command(), aht20_read_status(), aht20_init(), aht20_read().
- *    - This talks directly to the sensor with HAL I2C, without an external library.
- *
- * 7. LCD 1602A parallel 4-bit driver layer
- *    - lcd_write_4bits(), lcd_send(), lcd_command(), lcd_data(), lcd_init().
- *    - This controls RS/E/D4~D7 GPIO pins directly.
- *
- * 8. Display/reporting layer
- *    - lcd_show_status() writes the user-facing state to the LCD.
- *    - serial_show_display_status() mirrors the LCD-style status to UART.
- *
- * 9. Main application flow
- *    - main() initializes HAL/peripherals, prints boot checkpoints, then loops.
- *    - Every SENSOR_READ_INTERVAL_MS, it reads humidity and applies ON/OFF logic.
- *
- * 10. STM32Cube HAL setup and interrupt glue
- *    - SystemClock_Config(), MX_*_Init(), HAL_*_MspInit(), Error_Handler().
- *    - SysTick_Handler() is required so HAL_Delay() and HAL_GetTick() work.
- */
-
-/* 1. Hardware map and constants */
-
-#define AHT20_I2C_ADDRESS        (0x38 << 1)
-
-#define SENSOR_COUNT             2U
+#define SENSOR_COUNT             2U           //센서 개수에 대해 타입 Unsigned로 일치시킴, 경고 제거용
 
 #define LCD_RS_GPIO_PORT         GPIOA
 #define LCD_RS_GPIO_PIN          GPIO_PIN_10
@@ -139,12 +37,9 @@
 #define MAX_ON_TIME_MS           (3UL * 60UL * 60UL * 1000UL)
 #define MIN_OFF_TIME_MS          (5UL * 60UL * 1000UL)
 
-// Set to 1 while debugging upload/serial problems.
-// In this mode, the firmware does not initialize I2C, LCD, sensor, or servo.
 #define SERIAL_ONLY_TEST         0
 
-/* 2. HAL peripheral handles and runtime state */
-
+//HAL 핸들, 센서 핀
 I2C_HandleTypeDef hi2c1;
 TIM_HandleTypeDef htim3;
 UART_HandleTypeDef huart2;
@@ -167,6 +62,7 @@ static bool uart_ready = false;
 static uint32_t dehumidifier_turned_on_at = 0;
 static uint32_t dehumidifier_turned_off_at = 0;
 
+//함수 기본선언
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static bool MX_I2C1_Init(void);
@@ -174,8 +70,7 @@ static void MX_TIM3_Init(void);
 static void MX_USART2_UART_Init(void);
 static void Error_Handler(void);
 
-/* 3. Small utility layer */
-
+//유틸함수 - 시인성
 static void delay_ms(uint32_t ms)
 {
   HAL_Delay(ms);
@@ -245,8 +140,7 @@ static void uart_print_fixed_1(float value)
   uart_print_uint((uint32_t)(scaled % 10));
 }
 
-/* 4. Servo and dehumidifier actuator layer */
-
+//서보, 제습기 상태 제어
 static void servo_set_pulse_us(uint16_t pulse_us)
 {
   __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, pulse_us);
@@ -280,21 +174,12 @@ static void dehumidifier_set(bool on)
   }
 }
 
-/* 5. Safety and timing policy layer */
-
+//작동 확인 및 타이밍
 static bool min_off_time_passed(void)
 {
-  // Servo operation test mode:
-  // Ignore the 5-minute minimum OFF time so repeated button presses are easy to test.
+
   return true;
 
-  /*
-  if (dehumidifier_turned_off_at == 0) {
-    return true;
-  }
-
-  return (HAL_GetTick() - dehumidifier_turned_off_at) >= MIN_OFF_TIME_MS;
-  */
 }
 
 static bool max_on_time_passed(void)
@@ -302,6 +187,7 @@ static bool max_on_time_passed(void)
   return dehumidifier_on && ((HAL_GetTick() - dehumidifier_turned_on_at) >= MAX_ON_TIME_MS);
 }
 
+//센서 i2c 버스
 static void sensor_i2c_release_bus_pins(uint8_t sensor_index)
 {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
@@ -370,8 +256,7 @@ static bool sensor_i2c_select(uint8_t sensor_index)
   return MX_I2C1_Init();
 }
 
-/* 6. AHT20 sensor driver layer */
-
+//AHT20 센서
 static bool aht20_send_command(uint8_t command, uint8_t data0, uint8_t data1)
 {
   uint8_t tx_data[3] = {command, data0, data1};
@@ -464,8 +349,7 @@ static bool aht20_read_sensor(uint8_t sensor_index, float *humidity_percent, flo
   return aht20_read(humidity_percent, temperature_c);
 }
 
-/* 7. LCD 1602A parallel 4-bit driver layer */
-
+//LCD 1602A 4비트
 static void lcd_enable_pulse(void)
 {
   HAL_GPIO_WritePin(LCD_E_GPIO_PORT, LCD_E_GPIO_PIN, GPIO_PIN_SET);
@@ -571,8 +455,7 @@ static void lcd_clear_line(uint8_t row)
   }
 }
 
-/* 8. Display/reporting layer */
-
+//LCD에 상태 출력
 static void lcd_show_status(float humidity)
 {
   uint32_t humidity_ones = (uint32_t)(humidity + 0.5f);
@@ -600,8 +483,7 @@ static void serial_show_display_status(float humidity)
   uart_print("\r\n");
 }
 
-/* 9. Main application flow */
-
+//메인
 int main(void)
 {
   bool aht20_ready[SENSOR_COUNT] = {false};
@@ -732,8 +614,7 @@ int main(void)
   }
 }
 
-/* 10. STM32Cube HAL setup and interrupt glue */
-
+//HAL 설정 및 인터럽트 처리
 void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
