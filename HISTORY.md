@@ -5,7 +5,7 @@
 - 프로젝트: STM32_Humidity Sensor
 - 보드: Nucleo-F411RE
 - 개발환경: PlatformIO + STM32Cube HAL
-- 목표: AHT20 습도센서로 습도를 읽고, SG90 서보모터로 제습기 전원 버튼을 물리적으로 누르는 자동 제습기 제어기 제작. LCD 1602A도 나중에 병렬 4비트 방식으로 표시 예정.
+- 1차 목표: AHT20 습도센서로 습도를 읽고, SG90 서보모터로 제습기 전원 버튼을 물리적으로 누르는 자동 제습기 제어기 제작. LCD 1602A도 나중에 병렬 4비트 방식으로 표시 예정.
 
 ## Current Main Files
 
@@ -68,8 +68,6 @@ AHT20은 보통 I2C 주소가 `0x38`로 고정되어 있음. 같은 I2C 버스�
 
 ### 3. 1602A LCD Parallel 4-bit Mode
 
-아직 완전 검증 전.
-
 - LCD 1 VSS -> GND
 - LCD 2 VDD -> 3V3 또는 5V
 - LCD 3 V0 -> 가변저항 가운데 핀
@@ -94,12 +92,10 @@ AHT20은 보통 I2C 주소가 `0x38`로 고정되어 있음. 같은 I2C 버스�
 7. `HAL_Delay()`가 멈추는 문제가 있었음. 원인은 `SysTick_Handler()`가 없어서 HAL tick이 증가하지 않았기 때문.
 8. `main.c` 맨 아래에 아래 함수를 추가해서 해결:
 
-```c
 void SysTick_Handler(void)
 {
   HAL_IncTick();
 }
-```
 
 9. 문제 확인을 위해 `SERIAL_ONLY_TEST` 모드를 임시로 만들었음. `#define SERIAL_ONLY_TEST 1`이면 I2C/LCD/센서/서보 없이 시리얼만 1초마다 출력. 현재는 `#define SERIAL_ONLY_TEST 0`으로 다시 꺼둠.
 10. 현재 AHT20 습도센서는 시리얼 모니터에 정상 출력됨.
@@ -109,7 +105,7 @@ void SysTick_Handler(void)
 
 수정일: 2026-05-10
 
-14. `src/main.c` 상단에 학습용 코드 모듈 지도를 추가함. 하드웨어 핀/상수, HAL 핸들 및 실행 상태, UART/Delay 유틸리티, 서보 제어, 안전 시간 정책, AHT20 드라이버, LCD 드라이버, 표시 계층, `main()` 흐름, STM32Cube HAL 초기화 영역으로 분류함.
+14. `src/main.c` 상단에 코드 모듈 지도를 추가함. 하드웨어 핀/상수, HAL 핸들 및 실행 상태, UART/Delay 유틸리티, 서보 제어, 안전 시간 정책, AHT20 드라이버, LCD 드라이버, 표시 계층, `main()` 흐름, STM32Cube HAL 초기화 영역으로 분류함.
 15. 습도 센서 문제 확인을 위해 I2C 핀 조합을 바꿔 테스트할 수 있는 구조를 임시로 추가함. PB8/PB9와 PB6/PB7 조합을 선택할 수 있게 했음.
 16. 이후 센서 2개 다중화 구조로 확장하면서 `I2C_PIN_SET` 방식은 `SENSOR_COUNT`와 `sensor_i2c_buses[]` 테이블 방식으로 변경함.
 17. `SensorI2cBusConfig` 구조체와 `sensor_i2c_buses[]` 테이블을 추가하여 센서별 SCL/SDA 핀 정보를 관리하도록 변경함.
@@ -166,6 +162,12 @@ void SysTick_Handler(void)
 - LCD는 현재 코드상 병렬 4비트 방식이지만, 아직 실제 화면 출력은 완전히 검증되지 않았음.
 - LCD에 검은 블록만 보이는 경우 V0 대비 조절, RS/E/D4~D7 배선, 5V LCD와 3.3V 신호 호환 문제 확인 필요.
 - 다른 PC에서는 COM5가 아닐 수 있으므로 `platformio.ini`의 `monitor_port` 수정 필요.
-- `.pio` 폴더는 Git에 올리지 않아도 됨.
-- Git에 최소로 올릴 파일은 `platformio.ini`, `src/main.c`, `.gitignore`, `PROJECT_HISTORY.md`.
 - 수정일: 2026-05-10 - 두 번째 센서를 2m 정도 떨어뜨리기위해, 먼저 별도 전원 없이 Nucleo의 3V3/GND/SDA/SCL 4선을 연장해서 테스트하는 것으로 검토중. 무선 방식으로 갈 경우 센서 쪽 별도 MCU와 전원이 필요함.
+
+
+## Plan
+
+- 제습기 전원에 대해 물리적이 아닌 릴레이 방식으로 작동
+- 센서의 다중화로 실내 여러 위치에 대해 습도 측정
+- 센서의 무선화
+- 어플 제작 및 UI를 통해 별도 작동 기능 추가, 모드 분리
